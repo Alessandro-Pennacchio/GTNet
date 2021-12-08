@@ -3,26 +3,26 @@ import tensorflow as tf
 import tensorflow.keras.backend as K
 import tensorflow.keras.initializers
 from tensorflow.keras import layers, Model
+from tensorflow.keras.losses import CategoricalCrossentropy
 from tensorflow.keras.metrics import AUC
 from tensorflow.python.framework import dtypes
 
 VGG_Feature_Shape = (7, 7, 512)
+version = "25-1-SCE_GTNet"
 D: int = 512
 
+cce = CategoricalCrossentropy()
+
 def symmetric_cross_entropy( alpha, beta ):
-	# @ https://github.com/YisenWang/symmetric_cross_entropy_for_noisy_labels/blob/master/loss.py
+	"""
+	modified version of @https://github.com/YisenWang/symmetric_cross_entropy_for_noisy_labels/blob/master/loss.py
+	:param alpha:
+	:param beta:
+	:return:
+	"""
+	
 	def loss( y_true, y_pred ):
-		y_true_1 = K.cast_to_floatx( y_true )
-		y_pred_1 = y_pred
-		
-		y_true_2 = K.cast_to_floatx( y_true )
-		y_pred_2 = y_pred
-		
-		y_pred_1 = tf.clip_by_value( y_pred_1, 1e-7, 1.0 )
-		y_true_2 = tf.clip_by_value( y_true_2, 1e-4, 1.0 )
-		
-		return alpha * tf.reduce_mean( -tf.reduce_sum( y_true_1 * tf.math.log( y_pred_1 ), axis=-1 ) ) + \
-		       beta * tf.reduce_mean( -tf.reduce_sum( y_pred_2 * tf.math.log( y_true_2 ), axis=-1 ) )
+		return alpha * cce( y_true, y_pred ) + beta * cce( y_pred, y_true )
 	
 	return loss
 
@@ -48,7 +48,7 @@ def glove_embedding():
 		voc = unique_names()
 		word_index = dict( zip( voc, range( len( voc ) ) ) )
 		
-		num_tokens = len( voc ) + 2
+		num_tokens = len( voc )
 		embedding_dim = 100
 		hits = 0
 		misses = 0
@@ -74,17 +74,17 @@ def TX_Module( F, fGQ ):
 	F_K = layers.Conv2D( filters=D, kernel_size=(1, 1), activation="linear" )( F )
 	F_V = layers.Conv2D( filters=D, kernel_size=(1, 1), activation="linear" )( F )
 	
-	fGQ = K.reshape( fGQ, (-1, 1, 512) )
-	F_K = K.reshape( F_K, (-1, 49, 512) )
+	fGQ = K.reshape( fGQ, (-1, 1, D) )
+	F_K = K.reshape( F_K, (-1, 49, D) )
 	A = tf.nn.softmax( tf.matmul( fGQ, F_K, transpose_b=True ) / tf.sqrt( K.cast_to_floatx( D ) ) )
 	
 	A = K.reshape( A, (-1, 7, 7, 1) )
-	# F_V = K.reshape( F_V, (-1, 7, 7, 512) )
+	# F_V = K.reshape( F_V, (-1, 7, 7, D) )
 	fc = tf.math.multiply( A, F_V )
 	fc = tf.reduce_sum( fc, axis=[ 1, 2 ] )
-	fGQ = K.reshape( fGQ, (-1, 512) )
+	fGQ = K.reshape( fGQ, (-1, D) )
 	fc = layers.LayerNormalization()( layers.Add()( [ fc, fGQ ] ) )
-	fc = layers.LayerNormalization()( layers.Add()( [ fc, layers.Dense( D )( fc ) ] ) )
+	fc = layers.LayerNormalization()( layers.Add()( [ fc, layers.Dense( D, activation='relu' )( fc ) ] ) )
 	return fc
 
 def hoi_GTN_Model():
@@ -99,10 +99,16 @@ def hoi_GTN_Model():
 	num_tokens, embedding_dim, embedding_matrix = glove_embedding()
 	embeddingLayer = layers.Embedding( num_tokens, embedding_dim, embeddings_initializer=tensorflow.keras.initializers.Constant( embedding_matrix ),
 	                                   input_length=1, trainable=False )
+	
 	hum_emb = embeddingLayer( hum_num )
+	hum_emb = layers.LayerNormalization()( hum_emb )
+	
 	obj_emb = embeddingLayer( obj_num )
+	obj_emb = layers.LayerNormalization()( obj_emb )
+	
 	f_W = layers.Concatenate()( [ hum_emb, obj_emb ] )
-	f_W = layers.Dense( D )( f_W )
+	f_W = layers.Dense( D, activation='relu' )( f_W )
+	f_W = layers.LayerNormalization( name="f_W" )( f_W )
 	
 	# input4
 	input4 = layers.Input( (64, 64, 2), name="input4_mask" )
@@ -111,7 +117,9 @@ def hoi_GTN_Model():
 	mask = layers.Conv2D( filters=64, kernel_size=5, activation="tanh" )( mask )
 	mask = layers.AveragePooling2D()( mask )
 	mask = layers.Flatten()( mask )
-	f_S = layers.Dense( D, activation='relu' )( mask )
+	f_S = layers.Dense( D * 2, activation='relu' )( mask )
+	f_S = layers.Dense( D, activation='relu' )( f_S )
+	f_S = layers.LayerNormalization( name="f_S" )( f_S )
 	
 	# input6
 	input6 = layers.Input( shape=(2, 4), name="input6_roiBoxes" )
@@ -119,16 +127,22 @@ def hoi_GTN_Model():
 	f_H = tf.image.crop_and_resize( input1, input6[ :, 0 ], tf.range( 0, tf.shape( input1 )[ 0 ], dtype=tf.int32 ), np.array( [ 7, 7 ] ) )
 	f_O = tf.image.crop_and_resize( input1, input6[ :, 1 ], tf.range( 0, tf.shape( input1 )[ 0 ], dtype=tf.int32 ), np.array( [ 7, 7 ] ) )
 	
-	f_G = layers.AveragePooling2D()( input1 )
-	f_H = layers.AveragePooling2D()( f_H )
-	f_O = layers.AveragePooling2D()( f_O )
+	# todo: f_H and f_O  are missing residual blocks
 	
-	f_B = layers.Flatten()( layers.Concatenate()( [ f_G, f_H, f_O ] ) )
-	f_B = layers.Dense( D )( f_B )
+	f_G = layers.GlobalAvgPool2D( name="f_G" )( input1 )
+	f_H = layers.GlobalAvgPool2D( name="f_H" )( f_H )
+	f_O = layers.GlobalAvgPool2D( name="f_O" )( f_O )
+	
+	f_B = layers.Concatenate()( [ f_G, f_H, f_O ] )
+	f_B = layers.Dense( D * 2, activation='relu' )( f_B )
+	f_B = layers.Dense( units=D, activation='relu' )( f_B )
+	f_B = layers.LayerNormalization( name="f_B" )( f_B )
 	
 	# F_Ct
-	F_Ct = layers.Flatten()( layers.Concatenate()( [ f_H, f_O ] ) )
-	f_Q = layers.Dense( D )( F_Ct )
+	FC_t = layers.Concatenate()( [ f_H, f_O ] )
+	FC_t = layers.Dense( D * 2, activation='relu' )( FC_t )
+	FC_t = layers.Dense( D, activation='relu' )( FC_t )
+	f_Q = layers.LayerNormalization( name="f_Q" )( FC_t )
 	
 	f_GQ = layers.Multiply()( [ f_Q, f_S, f_W ] )
 	
@@ -136,8 +150,8 @@ def hoi_GTN_Model():
 	
 	f_BR = layers.Multiply()( [ f_B, f_S, f_W ] )
 	
-	p_I = tf.nn.sigmoid( layers.Dense( D )( layers.Concatenate()( [ f_B, f_BR, f_C ] ) ) )
-	b_I = tf.nn.sigmoid( layers.Dense( D )( layers.Concatenate()( [ f_B, f_BR ] ) ) )
+	p_I = tf.nn.sigmoid( layers.Dense( D, activation='relu' )( layers.Concatenate()( [ f_B, f_BR, f_C ] ) ) )
+	b_I = tf.nn.sigmoid( layers.Dense( D, activation='relu' )( layers.Concatenate()( [ f_B, f_BR ] ) ) )
 	
 	pHOI = layers.Multiply()( [ p_I, b_I ] )
 	pHOI = layers.Dense( 117 )( pHOI )
